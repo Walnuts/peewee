@@ -16,20 +16,114 @@ import time
 
 
 DATABASE_NAME = os.environ.get('PEEWEE_DATABASE', 'peewee.db')
+SQLITE = 101
+POSTGRES = 102
+MYSQL = 103
 logger = logging.getLogger('peewee.logger')
 
+class Engine(object):
+    """
+    Base class for database engines.  The `Database` class will merely
+    be the front end for the ORM user.  My hope will be that this will
+    allow us to plug pretty much any engine we want into this. 
+
+    Right now, this is the intended usage:
+
+        database = peewee.Database(peewee.SQLITE, DATABASE)
+
+    or for databases with more connection info:
+
+        database = peewee.Database(peewee.POSTGRES, host='myhost',
+            username='db_user', passwd='db_pass')
+
+    I regret that this means that the initial API for Peewee is changing, 
+    but that seemed like the cleanest way to add in the support for
+    multiple database engines.
+
+    One (temporary) solution for this would be to have the database
+    __init__ method check for whether arg[0] to the method is a string
+    or not.  It seems like most of the examples I have seen have the 
+    only argument to Database() being a string, the filename of the 
+    sqlite database.  It could check for the presence of the string
+    instead of the peewee.CONSTANT and auto-specify sqlite in that case.
+    """
+    host = None
+    username = None
+    password = None
+    database = None
+
+    def connect(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def close(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def execute(self, sql, params=None, commit=False):
+        raise NotImplementedError
+
+    def create_table(self, model_class):
+        raise NotImplementedError
+
+    def drop_table(self, model_class):
+        raise NotImplementedError
+
+class SqliteEngine(Engine):
+    try:
+        import sqlite3
+    except ImportError:
+        pass
+
+    def connect(self, database):
+        return sqlite3.connect(self.database)
+    def close(self, connection):
+        connection.close()
+    def execute(self, connection, sql, params=None, commit=False):
+        cursor = connection.cursor()
+        res = cursor.execute(sql, params or ())
+        if commit:
+            connection.commit()
+        logger.debug((sql, params))
+        return res
+    def last_insert_id(self, connection):
+        result = self.execute("SELECT last_insert_rowid();")
+        return result.fetchone()[0]
+    def create_table(self, model_class):
+        framing = "CREATE TABLE IF NOT EXISTS %s (%s);"
+        columns = []
+
+        for field in model_class._meta.fields.values():
+            columns.append(field.to_sql())
+
+        query = framing % (model_class._meta.db_table, ', '.join(columns))
+        
+        self.execute(query, commit=True)
+    def drop_table(self, model_class):
+        self.execute('DROP TABLE %s;' % model_class._meta.db_table, commit=True)
+
+class PostgresEngine(Engine):
+    pass
+
+class MysqlEngine(Engine):
+    pass
 
 class Database(object):
     def __init__(self, database):
+        """ should `database` be replaced with `engine`? """
         self.database = database
     
     def connect(self):
+        """ change this to `self.conn = engine.connect()`? """
         self.conn = sqlite3.connect(self.database)
     
     def close(self):
+        """ change this to `engine.close()`? """
         self.conn.close()
     
     def execute(self, sql, params=None, commit=False):
+        """ 
+        this will have to change to `engine.execute(*args, **kwargs)`.
+        there is too much engine-specific code here
+        """
         cursor = self.conn.cursor()
         res = cursor.execute(sql, params or ())
         if commit:
@@ -38,10 +132,18 @@ class Database(object):
         return res
     
     def last_insert_id(self):
+        """
+        IDK whether to put this as a method on the `Engine` class,
+        although it is definately implementation-specific. 
+        """
         result = self.execute("SELECT last_insert_rowid();")
         return result.fetchone()[0]
     
     def create_table(self, model_class):
+        """
+        engine-specific
+        need to implement Engine::create_table(self, model_class)
+        """
         framing = "CREATE TABLE IF NOT EXISTS %s (%s);"
         columns = []
 
@@ -53,6 +155,10 @@ class Database(object):
         self.execute(query, commit=True)
     
     def drop_table(self, model_class):
+        """
+        engine specific
+        need to implement Engine::drop_table(self, model_class)
+        """
         self.execute('DROP TABLE %s;' % model_class._meta.db_table, commit=True)
 
 
