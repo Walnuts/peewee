@@ -15,9 +15,6 @@ import time
 
 
 DATABASE_NAME = os.environ.get('PEEWEE_DATABASE', 'peewee.db')
-SQLITE = 101
-POSTGRES = 102
-MYSQL = 103
 logger = logging.getLogger('peewee.logger')
 
 
@@ -29,11 +26,11 @@ class Engine(object):
 
     Right now, this is the intended usage:
 
-        database = peewee.Database(peewee.SQLITE, DATABASE)
+        database = peewee.Database(peewee.SqliteEngine, DATABASE)
 
     or for databases with more connection info:
 
-        database = peewee.Database(peewee.POSTGRES, host='myhost',
+        database = peewee.Database(peewee.PostgresEngine, host='myhost',
             username='db_user', passwd='db_pass', database='mydb')
 
     I regret that this means that the initial API for Peewee is changing, 
@@ -45,7 +42,7 @@ class Engine(object):
     or not.  It seems like most of the examples I have seen have the 
     only argument to Database() being a string, the filename of the 
     sqlite database.  It could check for the presence of the string
-    instead of the peewee.CONSTANT and auto-specify sqlite in that case.
+    instead of the peewee.*Engine and auto-specify sqlite in that case.
     """
     host = None
     username = None
@@ -69,6 +66,28 @@ class Engine(object):
 
 class SqliteEngine(Engine):
     import sqlite3
+
+    stmts = {
+            'last_insert_id': "SELECT last_insert_rowid();",
+            'create_table': "CREATE TABLE IF NOT EXISTS %s (%s)",
+            'join': "%s JOIN %s AS %s ON %s = %s",
+            'drop_table': "DROP TABLE %s",
+            'not': "NOT %s",
+            'not_with_paren': "NOT (%s)",
+            'and': " AND ",
+            }
+    operations = {
+        'lt': '< ?',
+        'lte': '<= ?',
+        'gt': '> ?',
+        'gte': '>= ?',
+        'eq': '= ?',
+        'ne': '!= ?', # watch yourself with this one
+        'in': 'IN (%s)', # special-case to list q-marks
+        'is': 'IS ?',
+        'icontains': "LIKE ? ESCAPE '\\'", # surround param with %'s
+        'contains': "GLOB ?", # surround param with *'s
+    }
     def __init__(self, *args, **kwargs):
         self.database = kwargs.pop('database', None)
         if self.database is None:
@@ -89,11 +108,11 @@ class SqliteEngine(Engine):
         return res
 
     def last_insert_id(self):
-        result = self.execute("SELECT last_insert_rowid();")
+        result = self.execute(self.stmts['last_insert_id'])
         return result.fetchone()[0]
 
     def create_table(self, model_class):
-        framing = "CREATE TABLE IF NOT EXISTS %s (%s);"
+        framing = self.stmts['create_table']
         columns = []
 
         for field in model_class._meta.fields.values():
@@ -104,7 +123,8 @@ class SqliteEngine(Engine):
         self.execute(query, commit=True)
 
     def drop_table(self, model_class):
-        self.execute('DROP TABLE %s;' % model_class._meta.db_table, commit=True)
+        self.execute(self.stmts['drop_table'] % model_class._meta.db_table,\
+                commit=True)
 
 class PostgresEngine(Engine):
     pass
@@ -112,20 +132,14 @@ class PostgresEngine(Engine):
 class MysqlEngine(Engine):
     pass
 
-engines = {
-        SQLITE: SqliteEngine,
-        POSTGRES: PostgresEngine,
-        MYSQL: MysqlEngine,
-        }
-
 class Database(object):
-    def __init__(self, database_const, *args, **kwargs):
-        if isinstance(database_const, basestring):
+    def __init__(self, engine, *args, **kwargs):
+        if isinstance(engine, basestring):
             """ for backwards-compatible api """
-            kwargs['database'] = database_const
-            database_const = SQLITE
+            kwargs['database'] = engine
+            engine = SqliteEngine
 
-        self.engine = engines[database_const](**kwargs)
+        self.engine = engine(**kwargs)
         self.database = self.engine.database
     
     def connect(self):
@@ -138,10 +152,6 @@ class Database(object):
         return self.engine.execute(sql, params, commit)
     
     def last_insert_id(self):
-        """
-        IDK whether to put this as a method on the `Engine` class,
-        although it is definately implementation-specific. 
-        """
         return self.engine.last_insert_id()
     
     def create_table(self, model_class):
@@ -226,6 +236,10 @@ ternary = lambda cond, t, f: (cond and [t] or [f])[0]
 
 
 class Node(object):
+    """
+    Might have to make node accept an engine so we can abstract the 
+    exact sql statements away.
+    """
     def __init__(self, connector='AND'):
         self.connector = connector
         self.children = []
@@ -322,29 +336,14 @@ def parseq(*args, **kwargs):
 
 
 class BaseQuery(object):
-    """
-    operations might be something we'll have to get from the database
-    engine. IE, does `!=` for for `not equal` for all engines? I thought
-    Sql Server used `<>`...
-    """
-    operations = {
-        'lt': '< ?',
-        'lte': '<= ?',
-        'gt': '> ?',
-        'gte': '>= ?',
-        'eq': '= ?',
-        'ne': '!= ?', # watch yourself with this one
-        'in': 'IN (%s)', # special-case to list q-marks
-        'is': 'IS ?',
-        'icontains': "LIKE ? ESCAPE '\\'", # surround param with %'s
-        'contains': "GLOB ?", # surround param with *'s
-    }
     query_separator = '__'
     requires_commit = True
     force_alias = False
     
     def __init__(self, model):
         self.model = model
+        self.operations = self.model._meta.database.engine.operations
+        self.sql_stmts = self.model._meta.database.engine.stmts
         self.query_context = model
         self._where = {}
         self._joins = []
@@ -370,7 +369,7 @@ class BaseQuery(object):
             if op == 'in':
                 if isinstance(rhs, SelectQuery):
                     lookup_value = rhs
-                    operation = 'IN (%s)'
+                    operation = self.operations['in']
                 else:
                     lookup_value = [field.lookup_value(op, o) for o in rhs]
                     operation = self.operations[op] % \
@@ -462,7 +461,7 @@ class BaseQuery(object):
                         join_type = 'INNER'
                 
                 computed_joins.append(
-                    '%s JOIN %s AS %s ON %s = %s' % (
+                     self.sql_stmts['join'] % (
                         join_type,
                         model._meta.db_table,
                         alias_map[model],
@@ -497,7 +496,7 @@ class BaseQuery(object):
         connector = ' %s ' % node.connector
         query = connector.join(query)
         if node.negated:
-            query = 'NOT (%s)' % query
+            query = self.sql_stmts['not_with_paren'] % query
         return query, query_data
     
     def parse_q(self, q, model, alias_map):
@@ -516,12 +515,12 @@ class BaseQuery(object):
             query.append('%s %s' % (combined, operation))
         
         if len(query) > 1:
-            query = '(%s)' % (' AND '.join(query))
+            query = '(%s)' % (self.sql_stmts['and'].join(query))
         else:
             query = query[0]
         
         if q.negated:
-            query = 'NOT %s' % query
+            query = self.sql_stmts['not'] % query
         
         return query, query_data
 
