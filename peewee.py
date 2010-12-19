@@ -11,7 +11,6 @@ from datetime import datetime
 import logging
 import os
 import re
-import sqlite3
 import time
 
 
@@ -20,6 +19,7 @@ SQLITE = 101
 POSTGRES = 102
 MYSQL = 103
 logger = logging.getLogger('peewee.logger')
+
 
 class Engine(object):
     """
@@ -34,7 +34,7 @@ class Engine(object):
     or for databases with more connection info:
 
         database = peewee.Database(peewee.POSTGRES, host='myhost',
-            username='db_user', passwd='db_pass')
+            username='db_user', passwd='db_pass', database='mydb')
 
     I regret that this means that the initial API for Peewee is changing, 
     but that seemed like the cleanest way to add in the support for
@@ -68,25 +68,30 @@ class Engine(object):
         raise NotImplementedError
 
 class SqliteEngine(Engine):
-    try:
-        import sqlite3
-    except ImportError:
-        pass
+    import sqlite3
+    def __init__(self, *args, **kwargs):
+        self.database = kwargs.pop('database', None)
+        if self.database is None:
+            raise NameError('no attribute `database` found')
 
-    def connect(self, database):
-        return sqlite3.connect(self.database)
-    def close(self, connection):
-        connection.close()
-    def execute(self, connection, sql, params=None, commit=False):
-        cursor = connection.cursor()
+    def connect(self, *args, **kwargs):
+        self.conn = self.sqlite3.connect(self.database)
+
+    def close(self, *args, **kwargs):
+        self.conn.close()
+
+    def execute(self, sql, params=None, commit=False):
+        cursor = self.conn.cursor()
         res = cursor.execute(sql, params or ())
         if commit:
-            connection.commit()
+            self.conn.commit()
         logger.debug((sql, params))
         return res
-    def last_insert_id(self, connection):
+
+    def last_insert_id(self):
         result = self.execute("SELECT last_insert_rowid();")
         return result.fetchone()[0]
+
     def create_table(self, model_class):
         framing = "CREATE TABLE IF NOT EXISTS %s (%s);"
         columns = []
@@ -97,6 +102,7 @@ class SqliteEngine(Engine):
         query = framing % (model_class._meta.db_table, ', '.join(columns))
         
         self.execute(query, commit=True)
+
     def drop_table(self, model_class):
         self.execute('DROP TABLE %s;' % model_class._meta.db_table, commit=True)
 
@@ -106,60 +112,49 @@ class PostgresEngine(Engine):
 class MysqlEngine(Engine):
     pass
 
+engines = {
+        SQLITE: SqliteEngine,
+        POSTGRES: PostgresEngine,
+        MYSQL: MysqlEngine,
+        }
+
 class Database(object):
-    def __init__(self, database):
-        """ should `database` be replaced with `engine`? """
-        self.database = database
+    def __init__(self, database_const, *args, **kwargs):
+        if isinstance(database_const, basestring):
+            """ for backwards-compatible api """
+            kwargs['database'] = database_const
+            database_const = SQLITE
+
+        self.engine = engines[database_const](**kwargs)
+        self.database = self.engine.database
     
     def connect(self):
-        """ change this to `self.conn = engine.connect()`? """
-        self.conn = sqlite3.connect(self.database)
+        self.engine.connect()
     
     def close(self):
-        """ change this to `engine.close()`? """
-        self.conn.close()
+        self.engine.close()
     
     def execute(self, sql, params=None, commit=False):
-        """ 
-        this will have to change to `engine.execute(*args, **kwargs)`.
-        there is too much engine-specific code here
-        """
-        cursor = self.conn.cursor()
-        res = cursor.execute(sql, params or ())
-        if commit:
-            self.conn.commit()
-        logger.debug((sql, params))
-        return res
+        return self.engine.execute(sql, params, commit)
     
     def last_insert_id(self):
         """
         IDK whether to put this as a method on the `Engine` class,
         although it is definately implementation-specific. 
         """
-        result = self.execute("SELECT last_insert_rowid();")
-        return result.fetchone()[0]
+        return self.engine.last_insert_id()
     
     def create_table(self, model_class):
         """
         engine-specific
-        need to implement Engine::create_table(self, model_class)
         """
-        framing = "CREATE TABLE IF NOT EXISTS %s (%s);"
-        columns = []
-
-        for field in model_class._meta.fields.values():
-            columns.append(field.to_sql())
-
-        query = framing % (model_class._meta.db_table, ', '.join(columns))
-        
-        self.execute(query, commit=True)
+        return self.engine.create_table(model_class)
     
     def drop_table(self, model_class):
         """
         engine specific
-        need to implement Engine::drop_table(self, model_class)
         """
-        self.execute('DROP TABLE %s;' % model_class._meta.db_table, commit=True)
+        self.engine.drop_table(model_class)
 
 
 database = Database(DATABASE_NAME)
@@ -327,6 +322,11 @@ def parseq(*args, **kwargs):
 
 
 class BaseQuery(object):
+    """
+    operations might be something we'll have to get from the database
+    engine. IE, does `!=` for for `not equal` for all engines? I thought
+    Sql Server used `<>`...
+    """
     operations = {
         'lt': '< ?',
         'lte': '<= ?',
